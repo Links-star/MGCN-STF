@@ -1,0 +1,285 @@
+# ============================== 1. Environment Configuration & Hyperparameters ==============================
+# Initialize computing device (CUDA preferred, otherwise CPU)
+DEVICE = "CUDA" if CUDA_AVAILABLE else "CPU"
+# Fix random seed for reproducibility
+SET_SEED(42)
+
+# Hyperparameter definition (core tunable parameters)
+TIME_STEPS = 12          # Input sequence length
+BATCH_SIZE = 64           # Training batch size
+HIDDEN_UNITS = 32         # Number of hidden units for Transformer/GCN (must be divisible by 4 attention heads)
+LEARNING_RATE = 0.005     # Initial learning rate
+EPOCH = 100               # Maximum training epochs
+NODES = 30                # Number of nodes
+DROPOUT_RATE = 0.3        # Dropout rate
+REGULARIZER = 0.005       # L2 regularization coefficient
+NUM_TRANSFORMER_LAYERS = 2 # Number of Transformer encoder layers
+NUM_GCN_LAYERS = 3        # Number of GCN layers
+
+# Path configuration (placeholders, replace with actual paths)
+DATA_CSV_PATH = "path/to/your/data/Data.csv"
+ADJ_DIR = "path/to/your/adjacency_matrices"
+# Data normalizer (normalize to [0,1])
+SCALER = MinMaxScaler(feature_range=(0, 1))
+
+# ============================== 2. Data Loading & Preprocessing ==============================
+CLASS TrafficDataset:
+    CONSTRUCTOR(X, y, augment=False):
+        Convert X and y to Tensors and move to DEVICE
+        Record data augmentation switch (augment)
+    
+    METHOD __len__():
+        Return number of samples in the dataset
+    
+    METHOD __getitem__(idx):
+        Retrieve the idx-th sample (X[idx], y[idx])
+        If data augmentation is enabled:
+            Apply random temporal shift (-1/0/1 steps)
+            Add small Gaussian noise (mean=0, variance=0.01)
+        Return processed sample
+
+FUNCTION generate_seq(seq):
+    # Generate time-series samples: input first TIME_STEPS steps, output TIME_STEPS+1-th step
+    X = [seq[i:i+TIME_STEPS] for i in 0..len(seq)-TIME_STEPS-1]
+    y = [seq[i+TIME_STEPS] for i in 0..len(seq)-TIME_STEPS-1]
+    Convert X and y to numpy arrays and adjust dimensions (X: [num_samples, TIME_STEPS, NODES])
+    RETURN X, y
+
+FUNCTION load_data():
+    # Load raw data and split into training/validation/test sets (7:1:2)
+    dataset = READ_CSV(DATA_CSV_PATH)
+    Normalize data (fit based on training set)
+    Split raw data into training/validation/test sets
+    Generate time-series samples (call generate_seq)
+    Wrap into DataLoader (enable shuffle and data augmentation for training set)
+    PRINT data loading info (number of samples, batches, input/output shapes)
+    RETURN train_loader, val_loader, test_loader, X_test, y_test
+
+FUNCTION load_adjacency_matrices():
+    # Load and normalize 3 types of adjacency matrices
+    adj_files = {
+        "functional_similarity": ADJ_DIR + "/30x30_functional_similarity.csv",
+        "order_flow": ADJ_DIR + "/30x30_order_flow.csv",
+        "geographic_adjacency": ADJ_DIR + "/30x30_geographic_adjacency.csv"
+    }
+    adj_list = []
+    FOR each file in adj_files:
+        Read adjacency matrix and add self-loops
+        Compute inverse square root of degree matrix to normalize adjacency matrix
+        Convert to Tensor and move to DEVICE
+        Add to adj_list
+        PRINT adjacency matrix loading success info
+    RETURN adj_list
+
+# ============================== 3. Core Model Modules ==============================
+CLASS GConv:
+    CONSTRUCTOR(input_dim):
+        Initialize NUM_GCN_LAYERS linear transformation layers
+        Initialize Dropout layer
+        Weight initialization (Kaiming uniform distribution)
+    
+    METHOD forward(x, adj):
+        # x: [batch_size, NODES, input_dim], adj: [NODES, NODES]
+        current_x = x
+        FOR each layer in linear transformation layers:
+            current_x = Dropout(linear_transformation(current_x))
+            current_x = matrix_multiplication(adj_expanded_to_batch_dimension, current_x)
+            current_x = ReLU(current_x)
+        RETURN current_x
+
+CLASS Attention:
+    CONSTRUCTOR():
+        Initialize 2 linear transformation layers (w1, w2)
+        Weight initialization (w1 adapted for ReLU, w2 adapted for Sigmoid)
+    
+    METHOD forward(x, adj):
+        # x: [batch_size, TIME_STEPS, NODES]
+        x_pool = sum over node dimension ([batch_size, TIME_STEPS])
+        x_gcn_input = transpose x to [batch_size, NODES, TIME_STEPS]
+        x_gcn_output = GConv(input_dim=TIME_STEPS)(x_gcn_input, adj)
+        x_gcn_pool = sum over node dimension ([batch_size, TIME_STEPS])
+        x_hat = x_pool + x_gcn_pool  # Fuse pooled features
+        z = x_hat / NODES  # Normalization
+        Compute attention weights s = Sigmoid(ReLU(z @ w1 + b1) @ w2 + b2)
+        Save attention weights (for visualization)
+        x_reweight = x * s_expanded_to_batch_dimension ([batch_size, TIME_STEPS, 1])
+        RETURN x_reweight
+
+CLASS TransformerEncoder:
+    CONSTRUCTOR():
+        Initialize input projection layer (1D → HIDDEN_UNITS dimension)
+        Initialize Transformer encoder layer (nhead=4, batch_first=True)
+        Stack NUM_TRANSFORMER_LAYERS encoder layers
+        Initialize Dropout layer
+        Weight initialization (Kaiming uniform distribution)
+    
+    METHOD forward(x):
+        # x: [batch_size, TIME_STEPS, 1]
+        x_proj = Dropout(projection_layer(x))  # [batch_size, TIME_STEPS, HIDDEN_UNITS]
+        encoder_out = Transformer_encoder(x_proj)
+        RETURN Dropout(encoder_out[:, -1, :])  # Return output of the last time step
+
+CLASS MGCN_STFBranch:
+    CONSTRUCTOR():
+        self.attention = Attention()
+        self.transformer_list = [TransformerEncoder() for _ in 0..NODES-1]  # 1 Transformer per node
+        self.gcn = GConv(input_dim=HIDDEN_UNITS)
+    
+    METHOD forward(x, adj):
+        x_reweight = self.attention(x, adj)
+        transformer_outputs = []
+        FOR each node in 0..NODES-1:
+            node_feat = x_reweight[:, :, node:node+1]  # Extract temporal features of single node
+            trans_out = self.transformer_list[node](node_feat)
+            transformer_outputs.append(trans_out_expanded_dimension)
+        transformer_concat = concatenate transformer_outputs ([batch_size, NODES, HIDDEN_UNITS])
+        gcn_out = self.gcn(transformer_concat, adj)
+        Save GCN features (for visualization)
+        RETURN gcn_out
+
+CLASS MGCN_STF:
+    CONSTRUCTOR():
+        # 3 branches (corresponding to 3 types of adjacency matrices)
+        self.branch_simi = MGCN_STFBranch()
+        self.branch_dis = MGCN_STFBranch()
+        self.branch_cont = MGCN_STFBranch()
+        # Branch attention fusion layer
+        self.branch_attn = sequential_layer (Linear→ReLU→Dropout→Linear→Softmax)
+        # Output layer (HIDDEN_UNITS → 1)
+        self.output_layer = sequential_layer (Linear→ReLU→Dropout→Linear)
+        Weight initialization (Kaiming uniform distribution)
+    
+    METHOD forward(x, adj_list):
+        # Branch forward propagation
+        out_simi = self.branch_simi(x, adj_list[0])
+        out_dis = self.branch_dis(x, adj_list[1])
+        out_cont = self.branch_cont(x, adj_list[2])
+        # Branch fusion
+        cat_outs = concatenate outputs of 3 branches ([batch_size, NODES, HIDDEN_UNITS*3])
+        branch_weights = expand_dimension of self.branch_attn(cat_outs)
+        out_stack = stack outputs of 3 branches ([batch_size, NODES, 3, HIDDEN_UNITS])
+        fusion_out = weighted summation by branch weights
+        # Final output
+        output = compress dimension of self.output_layer(fusion_out) ([batch_size, NODES])
+        RETURN output
+
+# ============================== 4. Evaluation Metrics ==============================
+FUNCTION calculate_metrics(y_true, y_pred, phase):
+    # Denormalize to original scale
+    y_true_unscaled = SCALER.inverse_transform(y_true)
+    y_pred_unscaled = SCALER.inverse_transform(y_pred)
+    # Calculate core metrics: MSE, RMSE, MAE, MAPE (optimized truncation to avoid zero denominator), Pearson correlation coefficient
+    IF phase == "test":
+        PRINT true value statistics and comparison of first 5 samples
+    RETURN metric dictionary (including node-level RMSE/MAE)
+
+# ============================== 5. Visualization Module ==============================
+CLASS Visualizer:
+    CONSTRUCTOR(save_dir):
+        Create save directory
+        Initialize training/validation metric recording lists
+    
+    METHOD update_metrics(train_metric, val_metric):
+        Record training/validation metrics
+    
+    METHOD plot_multi_metrics():
+        Plot MSE/RMSE/MAE/MAPE/Pearson curves (training set vs validation set)
+        Save plot to save_dir
+    
+    METHOD plot_node_error_heatmap(node_rmse, node_mae):
+        Plot node-level RMSE/MAE heatmaps
+        Save plot to save_dir
+    
+    Other methods: plot_attention_weights (attention weight visualization), plot_gcn_tsne (GCN feature dimensionality reduction visualization)
+
+# ============================== 6. Training Pipeline ==============================
+FUNCTION train_model():
+    # Load data and adjacency matrices
+    train_loader, val_loader, test_loader, X_test, y_test = load_data()
+    adj_list = load_adjacency_matrices()
+    
+    # Initialize model, loss function, optimizer
+    model = MGCN_STF() move to DEVICE
+    criterion = MSELoss(reduction='none')  # For weighted loss
+    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=REGULARIZER)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+    
+    # Training monitoring variables
+    visualizer = Visualizer(save_dir="mgcn_stf_visualization")
+    best_val_rmse = infinity
+    best_model_path = visualizer.save_dir + "/best_mgcn_stf.pth"
+    
+    # Training loop
+    FOR epoch in 0..EPOCH-1:
+        # Training phase
+        model.set_mode("train")
+        train_total_loss = 0
+        Collect training set predictions and true values
+        FOR each batch in train_loader:
+            X_batch, y_batch = batch
+            y_pred = model(X_batch, adj_list)
+            loss = criterion(y_pred, y_batch)
+            weighted_loss = mean(loss * (1 + loss/loss.max()))  # Weighted loss
+            optimizer.zero_grad()
+            weighted_loss.backward()
+            Gradient clipping (max_norm=5.0)
+            optimizer.step()
+            Accumulate training loss
+        
+        # Validation phase
+        model.set_mode("eval")
+        val_total_loss = 0
+        Collect validation set predictions and true values
+        WITH gradient computation disabled:
+            FOR each batch in val_loader:
+                X_batch, y_batch = batch
+                y_pred = model(X_batch, adj_list)
+                val_loss = criterion(y_pred, y_batch).mean()
+                Accumulate validation loss
+        
+        # Calculate metrics and update learning rate
+        train_metric = calculate_metrics(training_true_values, training_predictions, phase="train")
+        val_metric = calculate_metrics(validation_true_values, validation_predictions, phase="val")
+        scheduler.step(val_metric["RMSE"])
+        
+        # Record metrics and visualize
+        visualizer.update_metrics(train_metric, val_metric)
+        IF (epoch+1) is a multiple of 10:
+            visualizer.plot_multi_metrics()
+            visualizer.plot_attention_weights(model.branch_simi.attention.attention_weights, epoch+1)
+            visualizer.plot_gcn_tsne(model.branch_simi.gcn_features, epoch+1)
+        
+        # Save best model
+        IF val_metric["RMSE"] < best_val_rmse:
+            best_val_rmse = val_metric["RMSE"]
+            SAVE_MODEL(model.state_dict(), best_model_path)
+            PRINT best model update info
+        
+        PRINT training log (epoch, training loss, validation RMSE/MAPE)
+    
+    # Test set evaluation
+    LOAD_MODEL(best_model, best_model_path)
+    model.set_mode("eval")
+    Collect test set predictions and true values
+    WITH gradient computation disabled:
+        FOR each batch in test_loader:
+            X_batch, y_batch = batch
+            y_pred = best_model(X_batch, adj_list)
+            Collect predictions and true values
+    test_metric = calculate_metrics(test_true_values, test_predictions, phase="test")
+    visualizer.plot_node_error_heatmap(test_metric["Node_RMSE"], test_metric["Node_MAE"])
+    PRINT final test set metrics (RMSE, MAE, MAPE, Pearson)
+
+# ============================== 7. Start Training ==============================
+IF __name__ == "__main__":
+    # Check if required files exist
+    Check DATA_CSV_PATH and 3 adjacency matrix files
+    IF files are missing:
+        Raise FileNotFoundError
+    # Print device info
+    IF DEVICE == "CUDA":
+        PRINT "CUDA acceleration enabled"
+    ELSE:
+        PRINT "Training with CPU"
+    # Start training
+    train_model()
